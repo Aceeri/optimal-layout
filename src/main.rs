@@ -1,6 +1,9 @@
-use bevy::color::palettes;
+use bevy::{color::palettes, math::U8Vec3};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
+use fxhash::FxHashMap;
+use fnv::FnvHasher;
+use rand::seq::SliceRandom;
 use std::io::prelude::*;
 
 use serde::{Deserialize, Serialize};
@@ -13,22 +16,43 @@ use morton::*;
 
 pub const WIDTH: usize = 16;
 
-#[derive(Resource, Clone, Serialize, Deserialize)]
-pub struct Layout(HashMap<IVec3, usize>);
+#[derive(Resource, Serialize, Deserialize)]
+pub struct Layout(HashMap<U8Vec3, usize, fnv::FnvBuildHasher>);
 
 pub fn linearize(point: IVec3) -> usize {
     point.x as usize + point.z as usize * WIDTH + point.y as usize * WIDTH * WIDTH
 }
 
 impl Layout {
+    pub fn new_random() -> Self {
+        let mut layout = Self(HashMap::with_capacity_and_hasher(WIDTH * WIDTH * WIDTH, default()));
+
+        let mut point_list = Vec::new();
+        for y in 0..WIDTH {
+            for x in 0..WIDTH {
+                for z in 0..WIDTH {
+                    point_list.push(IVec3::new(x as i32, y as i32, z as i32));
+                }
+            }
+        }
+
+        let mut rng = rand::rng();
+        point_list.shuffle(&mut rng);
+        for (index, point) in point_list.into_iter().enumerate() {
+            layout.0.insert(point.as_u8vec3(), index);
+        }
+
+        layout
+    }
+
     pub fn new_linear() -> Self {
-        let mut layout = Self(HashMap::with_capacity(WIDTH * WIDTH * WIDTH));
+        let mut layout = Self(HashMap::with_capacity_and_hasher(WIDTH * WIDTH * WIDTH, default()));
 
         for y in 0..WIDTH {
             for x in 0..WIDTH {
                 for z in 0..WIDTH {
                     let point = IVec3::new(x as i32, y as i32, z as i32);
-                    layout.0.insert(point, linearize(point));
+                    layout.0.insert(point.as_u8vec3(), linearize(point));
                 }
             }
         }
@@ -37,7 +61,7 @@ impl Layout {
     }
 
     pub fn new_morton() -> Self {
-        let mut layout = Self(HashMap::with_capacity(WIDTH * WIDTH * WIDTH));
+        let mut layout = Self(HashMap::with_capacity_and_hasher(WIDTH * WIDTH * WIDTH, default()));
 
         for y in 0..WIDTH {
             for x in 0..WIDTH {
@@ -45,7 +69,7 @@ impl Layout {
                     let point = UVec3::new(x as u32, y as u32, z as u32);
                     layout
                         .0
-                        .insert(point.as_ivec3(), Morton3D::encode(point).unwrap() as usize);
+                        .insert(point.as_u8vec3(), to_morton_index(point) as usize);
                 }
             }
         }
@@ -54,16 +78,18 @@ impl Layout {
     }
 
     pub fn position(&self, point: IVec3) -> usize {
-        self.0.get(&point).copied().unwrap_or(usize::MAX)
+        self.0.get(&point.as_u8vec3()).copied().unwrap_or(usize::MAX)
     }
 
     pub fn heuristic(&self) -> usize {
         let mut total = 0;
         for (&point, &point_position) in self.0.iter() {
-            for neighbor in Self::neighbors(point) {
+            for neighbor in Self::neighbors(point.as_ivec3()) {
                 let neighbor_pos = self.position(neighbor);
-                total += (neighbor_pos as isize - point_position as isize).abs() as usize;
-                total -= 1;
+                let distance = (neighbor_pos as isize - point_position as isize).abs() as usize;
+                if distance >= 32 { // 64 bytes because we have 2 byte voxels
+                    total += 1;
+                }
             }
         }
 
@@ -90,7 +116,7 @@ impl Layout {
 
     pub fn swap(&mut self, a: IVec3, b: IVec3) {
         assert!(Self::in_bounds(a) && Self::in_bounds(b));
-        let [a_pos, b_pos] = self.0.get_many_mut([&a, &b]);
+        let [a_pos, b_pos] = self.0.get_many_mut([&a.as_u8vec3(), &b.as_u8vec3()]);
         std::mem::swap(a_pos.unwrap(), b_pos.unwrap());
     }
 }
@@ -123,6 +149,8 @@ pub struct RandomSearch {
     pub running: bool,
     pub load: bool,
     pub save_every: usize,
+
+    pub run_name: &'static str,
 }
 
 impl RandomSearch {
@@ -148,8 +176,11 @@ pub fn random_search(
         return;
     }
 
+    // const MAX_SWAPS: usize = WIDTH * 2.0;
+    const MAX_SWAPS: usize = WIDTH * WIDTH * 3;
+    // const MAX_SWAPS: usize = WIDTH * WIDTH * WIDTH;
     // const MAX_SWAPS: usize = 27;
-    const MAX_SWAPS: usize = 5;
+    // const MAX_SWAPS: usize = 216;
     const PROGRESS: usize = 10_000;
     let mut rng = rand::rng();
 
@@ -160,12 +191,12 @@ pub fn random_search(
                 "iteration: {:?}: current best: {:?} ({:?}% initial, {:03?}% linear, {:03?}% morton)",
                 search.iteration,
                 search.best_heuristic,
-                ((search.best_heuristic as f32 / search.initial_heuristic as f32) - 1.0).abs()
-                    * 100.0,
-                ((search.best_heuristic as f32 / search.linear_heuristic as f32) - 1.0).abs()
-                    * 100.0,
-                ((search.best_heuristic as f32 / search.morton_heuristic as f32) - 1.0).abs()
-                    * 100.0,
+                ((search.best_heuristic as f32 / search.initial_heuristic as f32) - 1.0)
+                    * -100.0,
+                ((search.best_heuristic as f32 / search.linear_heuristic as f32) - 1.0)
+                    * -100.0,
+                ((search.best_heuristic as f32 / search.morton_heuristic as f32) - 1.0)
+                    * -100.0,
             );
         }
 
@@ -277,8 +308,8 @@ pub fn write_layout_to_file(
 
     let local_now: chrono::DateTime<chrono::Local> = chrono::Local::now();
     let now = local_now.format("%Y-%m-%d-%H:%M:%S").to_string();
-    let backup_name = format!("./layouts/backup/layout-{}^3-{}.yml", WIDTH, now);
-    let name = format!("./layouts/layout-{}^3.yml", WIDTH);
+    let backup_name = format!("./layouts/backup/layout-{}-{}^3-{}.yml", search.run_name, WIDTH, now);
+    let name = format!("./layouts/layout-{}-{}^3.yml", search.run_name, WIDTH);
     println!("backup_name: {:?}", backup_name);
     let mut current_layout = std::fs::File::create(name).unwrap();
     let mut backup_layout = std::fs::File::create(backup_name).unwrap();
@@ -302,7 +333,7 @@ pub fn load_layout_from_file(
     search.load = false;
 
     info!("LOADING LAYOUT");
-    let name = format!("./layouts/layout-{}^3.yml", WIDTH);
+    let name = format!("./layouts/layout-{}-{}^3.yml", search.run_name, WIDTH);
     println!("name: {:?}", name);
     let Ok(layout_str) = std::fs::read_to_string(name.clone()) else {
         warn!("No {:?} saved", name);
@@ -317,7 +348,7 @@ pub fn load_layout_from_file(
 }
 
 fn main() -> AppExit {
-    // compare_bases();
+    compare_bases();
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins);
@@ -325,20 +356,24 @@ fn main() -> AppExit {
     app.add_plugins(controller::CameraControllerPlugin);
     app.add_systems(Startup, spawn_entities);
 
-    // let layout = Layout::new_morton();
-    let layout = Layout::new_linear();
-    println!("initial linear heuristic: {:?}", layout.heuristic());
+    // let layout = Layout::new_hilbert();
+    let layout = Layout::new_morton();
+    // let layout = Layout::new_linear();
+    // let layout = Layout::new_random();
+    println!("initial heuristic: {:?}", layout.heuristic());
 
     app.insert_resource(RandomSearch {
         best_heuristic: layout.heuristic(),
         initial_heuristic: layout.heuristic(),
         linear_heuristic: Layout::new_linear().heuristic(),
         morton_heuristic: Layout::new_morton().heuristic(),
-        per_frame: 100_000,
+        per_frame: 10,
         iteration: 0,
         running: true,
         load: true,
         save_every: 1_000_000,
+
+        run_name: "cache-morton",
     });
     app.insert_resource(layout);
     app.insert_resource(AmbientLight {

@@ -12,3 +12,6 @@ iyes_perf_ui = "0.5"
 
 serde = "1"
 serde_yml = "0.0.12"
+
+fxhash = "0.2.1"
+fnv = "1"
